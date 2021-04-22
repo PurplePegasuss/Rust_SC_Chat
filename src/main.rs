@@ -5,7 +5,6 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::collections::HashMap;
-use std::borrow::Borrow;
 
 type Shared<T> = Arc<Mutex<T>>;
 
@@ -68,6 +67,7 @@ fn main() {
                 thread::spawn(move || {
                     let stream = acceptor.accept(stream).unwrap();
                     let stream = Arc::new(Mutex::new(stream));
+                    stream.lock().unwrap().get_ref().set_nonblocking(true).unwrap();
                     handle_client(stream, all_sockets, credentials_db);
                 });
             }
@@ -92,7 +92,7 @@ fn handle_authorization(
         let mut buf = vec!();
 
         // Read login/register credentials
-        read_until_2rn(&mut stream.lock().unwrap(), &mut buf);
+        read_until_2rn(&stream, &mut buf, 100);
         let ind_cred_raw = String::from_utf8_lossy(&buf);
 
         // 2 or 3 sized vector (depending on login or registration)
@@ -168,16 +168,19 @@ fn recieve_and_broadcast(
     let mut msg_buf = vec!();
     loop {
         // Read the message
-        read_until_2rn(&mut stream.lock().unwrap(), &mut msg_buf);
+        read_until_2rn(&stream, &mut msg_buf, 100);
         let msg = String::from_utf8_lossy(&msg_buf);
+        println!("Recieved '{}'", msg);
         let msg_formatted = format!(
             "[{}]{}:{}",
             chrono::offset::Local::now().format("%H:%M:%S"),
             username,
             msg);
+        println!("Formatted '{}'", msg_formatted);
         // Send to all clients
         for socket in all_sockets.lock().unwrap().iter() {
-            send_to_stream(&socket, msg_formatted.as_bytes());
+            println!("Sent the message to '{}'", socket.lock().unwrap().get_ref().peer_addr().unwrap());
+            send_to_stream(&socket, msg_formatted.as_bytes()).unwrap();
         }
 
         msg_buf.clear();
@@ -214,13 +217,14 @@ fn send_to_stream(stream: & Shared<TlsStream<TcpStream>>, buf: &[u8]) -> Result<
     stream.lock().unwrap().write_all(message.as_bytes())
 }
 
-/// Reads from the stream until it receives '\r\n\r\n' sequence
-/// Does not include the sequence in the result
-fn read_until_2rn(stream: &mut TlsStream<TcpStream>, buf: &mut Vec<u8>) {
+/// Continuously reads from the stream (if any pending bytes present) or checks every `millis`
+/// milliseconds until it receives '\r\n\r\n' sequence. 
+/// Does not include the sequence in the result.
+fn read_until_2rn(stream: & Shared<TlsStream<TcpStream>>, buf: &mut Vec<u8>, millis: u64) {
     let mut inner_buf = [0];
     let mut was_r = false;
     let mut rn_count = 0;
-    while rn_count < 2 && match stream.read(&mut inner_buf) {
+    while rn_count < 2 && match stream.lock().unwrap().read(&mut inner_buf) {
         Ok(size) => {
             // If no bytes were read - just skip (maybe packet loss
             // or something)
@@ -251,6 +255,10 @@ fn read_until_2rn(stream: &mut TlsStream<TcpStream>, buf: &mut Vec<u8>) {
                     was_r = false;
                 }
             }
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            thread::sleep(std::time::Duration::from_millis(millis));
             true
         }
         Err(e) => {
