@@ -67,6 +67,7 @@ fn main() {
                 thread::spawn(move || {
                     let stream = acceptor.accept(stream).unwrap();
                     let stream = Arc::new(Mutex::new(stream));
+                    stream.lock().unwrap().get_ref().set_nonblocking(true).unwrap();
                     handle_client(stream, all_sockets, credentials_db);
                 });
             }
@@ -77,27 +78,26 @@ fn main() {
     }
 }
 
-/// Function which performs basic communicative operations with the client
-fn handle_client(
-    stream: Shared<TlsStream<TcpStream>>,
-    all_sockets: Shared<Vec<Shared<TlsStream<TcpStream>>>>,
-    credentials_db: Shared<HashMap<String, Client>>)
+fn handle_authorization(
+    stream: & Shared<TlsStream<TcpStream>>,
+    credentials_db: & Shared<HashMap<String, Client>>
+) -> String
 {
     let mut authentication_incorrect: bool = true;
+    let mut client_username = String::new();
     while authentication_incorrect {
         println!("New client {}. Sending a request to provide credentials...",
                  stream.lock().unwrap().get_ref().peer_addr().unwrap());
-        all_sockets.lock().unwrap().push(stream.clone());
 
         let mut buf = vec!();
 
         // Read login/register credentials
-        read_until_2rn(&mut stream.lock().unwrap(), &mut buf);
+        read_until_2rn(&stream, &mut buf, 100);
         let ind_cred_raw = String::from_utf8_lossy(&buf);
 
         // 2 or 3 sized vector (depending on login or registration)
         let mut ind_credentials: Vec<&str> = ind_cred_raw.split("/").collect();
-        
+
         // Trim all entries in case of [white_spaces](https://doc.rust-lang.org/std/primitive.char.html)
         for i in 0..ind_credentials.len() {
             ind_credentials[i] = ind_credentials[i].trim();
@@ -114,12 +114,12 @@ fn handle_client(
                     //if passwords match, we send signal to a client to stop entering credentials
                     println!("Login successful.");
                     send_to_stream(&stream, b"correct").unwrap();
+                    client_username = credentials_db.lock().unwrap().get(ind_credentials[0]).unwrap().username.clone();
                     authentication_incorrect = false;
                 }
                 else {
                     //if passwords do not match, we send signal to continue entering credentials
                     println!("Invalid password.");
-                    println!("Correct : '{}', Given : '{}'", credentials_db.lock().unwrap().get(ind_credentials[0]).unwrap().password, ind_credentials[1]);
                     send_to_stream(&stream, b"Invalid password.").unwrap();
                 }
             } else {
@@ -141,6 +141,7 @@ fn handle_client(
                                                       });
                 send_to_stream(&stream, b"correct").unwrap();
                 println!("Registration successful.\n");
+                client_username = ind_credentials[2].to_string();
                 authentication_incorrect = false;
             }else{
                 //if there is such name in database, we can't create additional account
@@ -153,8 +154,59 @@ fn handle_client(
             println!("Invalid format");
             send_to_stream(&stream, b"Invalid format").unwrap();
         }
+
         buf.clear();
     }
+    client_username
+}
+
+fn recieve_and_broadcast(
+    stream: & Shared<TlsStream<TcpStream>>,
+    all_sockets: & Shared<Vec<Shared<TlsStream<TcpStream>>>>,
+    username: String)
+{
+    let mut msg_buf = vec!();
+    loop {
+        // Read the message
+        read_until_2rn(&stream, &mut msg_buf, 100);
+        let msg = String::from_utf8_lossy(&msg_buf);
+        println!("Recieved '{}'", msg);
+        let msg_formatted = format!(
+            "[{}]{}:{}",
+            chrono::offset::Local::now().format("%H:%M:%S"),
+            username,
+            msg);
+        println!("Formatted '{}'", msg_formatted);
+        // Send to all clients
+        for socket in all_sockets.lock().unwrap().iter() {
+            println!("Sent the message to '{}'", socket.lock().unwrap().get_ref().peer_addr().unwrap());
+            send_to_stream(&socket, msg_formatted.as_bytes()).unwrap();
+        }
+
+        msg_buf.clear();
+    }
+}
+
+/// Function which performs basic communicative operations with the client
+fn handle_client(
+    stream: Shared<TlsStream<TcpStream>>,
+    all_sockets: Shared<Vec<Shared<TlsStream<TcpStream>>>>,
+    credentials_db: Shared<HashMap<String, Client>>)
+{
+    all_sockets.lock().unwrap().push(stream.clone());
+    let our_addr = stream.lock().unwrap().get_ref().local_addr().unwrap(); // communism
+    let client_addr = stream.lock().unwrap().get_ref().peer_addr().unwrap();
+
+    let username = handle_authorization(& stream, & credentials_db);
+    recieve_and_broadcast(&stream, &all_sockets, username);
+
+    // Remove current stream from list of all sockets
+    all_sockets.lock().unwrap().retain(
+        |shared_stream| -> bool {
+            our_addr == shared_stream.lock().unwrap().get_ref().local_addr().unwrap() &&
+                client_addr == shared_stream.lock().unwrap().get_ref().peer_addr().unwrap()
+        }
+    );
     // End connection after serving the client
     stream.lock().unwrap().shutdown().unwrap();
 }
@@ -165,13 +217,14 @@ fn send_to_stream(stream: & Shared<TlsStream<TcpStream>>, buf: &[u8]) -> Result<
     stream.lock().unwrap().write_all(message.as_bytes())
 }
 
-/// Reads from the stream until it receives '\r\n\r\n' sequence
-/// Does not include the sequence in the result
-fn read_until_2rn(stream: &mut TlsStream<TcpStream>, buf: &mut Vec<u8>) {
+/// Continuously reads from the stream (if any pending bytes present) or checks every `millis`
+/// milliseconds until it receives '\r\n\r\n' sequence. 
+/// Does not include the sequence in the result.
+fn read_until_2rn(stream: & Shared<TlsStream<TcpStream>>, buf: &mut Vec<u8>, millis: u64) {
     let mut inner_buf = [0];
     let mut was_r = false;
     let mut rn_count = 0;
-    while rn_count < 2 && match stream.read(&mut inner_buf) {
+    while rn_count < 2 && match stream.lock().unwrap().read(&mut inner_buf) {
         Ok(size) => {
             // If no bytes were read - just skip (maybe packet loss
             // or something)
@@ -202,6 +255,10 @@ fn read_until_2rn(stream: &mut TlsStream<TcpStream>, buf: &mut Vec<u8>) {
                     was_r = false;
                 }
             }
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            thread::sleep(std::time::Duration::from_millis(millis));
             true
         }
         Err(e) => {
