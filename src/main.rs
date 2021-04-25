@@ -160,33 +160,6 @@ fn handle_authorization(
     client_username
 }
 
-fn recieve_and_broadcast(
-    stream: & Shared<TlsStream<TcpStream>>,
-    all_sockets: & Shared<Vec<Shared<TlsStream<TcpStream>>>>,
-    username: String)
-{
-    let mut msg_buf = vec!();
-    loop {
-        // Read the message
-        read_until_2rn(&stream, &mut msg_buf, 100);
-        let msg = String::from_utf8_lossy(&msg_buf);
-        println!("Recieved '{}'", msg);
-        let msg_formatted = format!(
-            "[{}]{}:{}",
-            chrono::offset::Local::now().format("%H:%M:%S"),
-            username,
-            msg);
-        println!("Formatted '{}'", msg_formatted);
-        // Send to all clients
-        for socket in all_sockets.lock().unwrap().iter() {
-            println!("Sent the message to '{}'", socket.lock().unwrap().get_ref().peer_addr().unwrap());
-            send_to_stream(&socket, msg_formatted.as_bytes()).unwrap();
-        }
-
-        msg_buf.clear();
-    }
-}
-
 /// Function which performs basic communicative operations with the client
 fn handle_client(
     stream: Shared<TlsStream<TcpStream>>,
@@ -203,12 +176,55 @@ fn handle_client(
     // Remove current stream from list of all sockets
     all_sockets.lock().unwrap().retain(
         |shared_stream| -> bool {
-            our_addr == shared_stream.lock().unwrap().get_ref().local_addr().unwrap() &&
-                client_addr == shared_stream.lock().unwrap().get_ref().peer_addr().unwrap()
+            let shared_our_addr: bool = (our_addr == shared_stream.lock().unwrap().get_ref().local_addr().unwrap());
+            let shared_client_addr: bool = client_addr == shared_stream.lock().unwrap().get_ref().peer_addr().unwrap();
+            !shared_our_addr || !shared_client_addr
         }
     );
+
     // End connection after serving the client
-    stream.lock().unwrap().shutdown().unwrap();
+    match stream.lock().unwrap().shutdown(){
+        Ok(..)=>{
+        }
+        Err(..)=>{
+            println!("Error shutting down a connection from the server side.");
+        }
+    }
+}
+/// Function which recieves a message from client and broadcasts it to all clients
+fn recieve_and_broadcast(
+    stream: & Shared<TlsStream<TcpStream>>,
+    all_sockets: & Shared<Vec<Shared<TlsStream<TcpStream>>>>,
+    username: String)
+{
+    let mut msg_buf = vec!();
+    'outer: loop {
+        // Read the message
+        read_until_2rn(&stream, &mut msg_buf, 100);
+        let msg = String::from_utf8_lossy(&msg_buf);
+        if msg == "/exit" {
+            send_to_stream(&stream, msg.as_bytes()).unwrap();
+            break
+        }
+        // Transforming the message to appropriate format
+        let msg_formatted = format!(
+            "[{}]{}:{}",
+            chrono::offset::Local::now().format("%H:%M:%S"),
+            username,
+            msg);
+        // Send to all clients
+        for socket in all_sockets.lock().unwrap().iter(){
+            match send_to_stream(&socket, msg_formatted.as_bytes()) {
+                Ok(..) => {
+                    println!("Sent the message to '{}'", socket.lock().unwrap().get_ref().peer_addr().unwrap());
+                }
+                Err(..) => {
+                    break 'outer;
+                }
+            }
+        }
+        msg_buf.clear();
+    }
 }
 
 fn send_to_stream(stream: & Shared<TlsStream<TcpStream>>, buf: &[u8]) -> Result<(), std::io::Error> {
