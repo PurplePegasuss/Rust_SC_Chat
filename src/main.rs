@@ -98,8 +98,8 @@ fn handle_authorization(
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
                 break;
             }
-            Err(_) => { 
-                println!("Stopped recieving messages from {} due to unexpected error.", stream.lock().unwrap().get_ref().peer_addr().unwrap());
+            Err(e) => {
+                println!("Can't read more messages from {}: {}; kind: {:?}", stream.lock().unwrap().get_ref().peer_addr().unwrap(), e, e.kind());
                 break;
             }
             _ => {}
@@ -190,10 +190,13 @@ fn handle_client(
         |shared_stream| -> bool {
             let shared_our_addr: bool = our_addr == shared_stream.lock().unwrap().get_ref().local_addr().unwrap();
             let shared_client_addr: bool = client_addr == shared_stream.lock().unwrap().get_ref().peer_addr().unwrap();
-            !shared_our_addr || !shared_client_addr
+            if !shared_our_addr || !shared_client_addr {
+                println!("Removed socket from the list!");
+                true
+            }
+            else { false }
         }
     );
-    println!("Removed socket from the list!");
 
     // End connection after serving the client
     match stream.lock().unwrap().shutdown(){
@@ -214,14 +217,14 @@ fn recieve_and_broadcast(
     username: String)
 {
     let mut msg_buf = vec!();
-    'outer: loop {
+    loop {
         // Read the message
         match read_until_2rn(&stream, &mut msg_buf, 100) {
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
                 break;
             }
-            Err(_) => { 
-                println!("Stopped recieving messages from {} due to unexpected error.", stream.lock().unwrap().get_ref().peer_addr().unwrap());
+            Err(e) => { 
+                println!("Can't read more messages from {}: {}; kind: {:?}", stream.lock().unwrap().get_ref().peer_addr().unwrap(), e, e.kind());
                 break;
             }
             _ => {}
@@ -310,7 +313,6 @@ fn read_until_2rn(stream: & Shared<TlsStream<TcpStream>>, buf: &mut Vec<u8>, mil
             true
         }
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
-            println!("lock dead?");
             println!("Failed to read from stream, {:?}", e.kind());
             return Err(e);
         }
