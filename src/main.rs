@@ -56,6 +56,8 @@ fn main() {
         )
     );
 
+    println!("Listening to incoming connections..");
+
     // Establishing connection for each client in listening queue
     for stream in listener.incoming() {
         match stream {
@@ -92,7 +94,16 @@ fn handle_authorization(
         let mut buf = vec!();
 
         // Read login/register credentials
-        read_until_2rn(&stream, &mut buf, 100);
+        match read_until_2rn(&stream, &mut buf, 100) {
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                break;
+            }
+            Err(e) => {
+                println!("Can't read more messages from {}: {}; kind: {:?}", stream.lock().unwrap().get_ref().peer_addr().unwrap(), e, e.kind());
+                break;
+            }
+            _ => {}
+        }
         let ind_cred_raw = String::from_utf8_lossy(&buf);
 
         // 2 or 3 sized vector (depending on login or registration)
@@ -174,11 +185,16 @@ fn handle_client(
     recieve_and_broadcast(&stream, &all_sockets, username);
 
     // Remove current stream from list of all sockets
+    println!("Start removing socket from list...");
     all_sockets.lock().unwrap().retain(
         |shared_stream| -> bool {
-            let shared_our_addr: bool = (our_addr == shared_stream.lock().unwrap().get_ref().local_addr().unwrap());
+            let shared_our_addr: bool = our_addr == shared_stream.lock().unwrap().get_ref().local_addr().unwrap();
             let shared_client_addr: bool = client_addr == shared_stream.lock().unwrap().get_ref().peer_addr().unwrap();
-            !shared_our_addr || !shared_client_addr
+            if !shared_our_addr || !shared_client_addr {
+                println!("Removed socket from the list!");
+                true
+            }
+            else { false }
         }
     );
 
@@ -186,8 +202,11 @@ fn handle_client(
     match stream.lock().unwrap().shutdown(){
         Ok(..)=>{
         }
-        Err(..)=>{
-            println!("Error shutting down a connection from the server side.");
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+            println!("Couldn't shutdown connection because it was already closed");
+        }
+        Err(e)=>{
+            println!("Error shutting down a connection from the server side. {:?}", e.kind());
         }
     }
 }
@@ -198,10 +217,25 @@ fn recieve_and_broadcast(
     username: String)
 {
     let mut msg_buf = vec!();
-    'outer: loop {
+    loop {
         // Read the message
-        read_until_2rn(&stream, &mut msg_buf, 100);
+        match read_until_2rn(&stream, &mut msg_buf, 100) {
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                break;
+            }
+            Err(e) => { 
+                println!("Can't read more messages from {}: {}; kind: {:?}", stream.lock().unwrap().get_ref().peer_addr().unwrap(), e, e.kind());
+                break;
+            }
+            _ => {}
+        }
+
         let msg = String::from_utf8_lossy(&msg_buf);
+        println!("Recieved '{}'", msg);
+        if msg == "" {
+            msg_buf.clear();
+            continue;
+        }
         if msg == "/exit" {
             send_to_stream(&stream, msg.as_bytes()).unwrap();
             break
@@ -219,7 +253,8 @@ fn recieve_and_broadcast(
                     println!("Sent the message to '{}'", socket.lock().unwrap().get_ref().peer_addr().unwrap());
                 }
                 Err(..) => {
-                    break 'outer;
+                    println!("Couldn't broadcast message, moving on...");
+                    continue;
                 }
             }
         }
@@ -236,7 +271,7 @@ fn send_to_stream(stream: & Shared<TlsStream<TcpStream>>, buf: &[u8]) -> Result<
 /// Continuously reads from the stream (if any pending bytes present) or checks every `millis`
 /// milliseconds until it receives '\r\n\r\n' sequence. 
 /// Does not include the sequence in the result.
-fn read_until_2rn(stream: & Shared<TlsStream<TcpStream>>, buf: &mut Vec<u8>, millis: u64) {
+fn read_until_2rn(stream: & Shared<TlsStream<TcpStream>>, buf: &mut Vec<u8>, millis: u64) -> Result<(), std::io::Error> {
     let mut inner_buf = [0];
     let mut was_r = false;
     let mut rn_count = 0;
@@ -277,9 +312,14 @@ fn read_until_2rn(stream: & Shared<TlsStream<TcpStream>>, buf: &mut Vec<u8>, mil
             thread::sleep(std::time::Duration::from_millis(millis));
             true
         }
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+            println!("Failed to read from stream, {:?}", e.kind());
+            return Err(e);
+        }
         Err(e) => {
-            println!("Error while receiving message: {}", e);
+            println!("Error while receiving message: '{}', kind = {:?}", e, e.kind());
             false
         }
     } {}
+    Ok(())
 }
