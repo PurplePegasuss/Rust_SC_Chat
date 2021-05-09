@@ -21,6 +21,7 @@
 
 # emailAddress                   = Email Address
 # "
+mkdir -p result
 
 openssl req -x509 -newkey rsa:4096 -config csr.conf -keyout result/myPrivateKey.pem -out result/certificate.crt -days 365 -nodes
 
